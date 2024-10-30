@@ -1,0 +1,456 @@
+---
+title: "Practical ML in R - Coursera Assignment final"
+author: "Paulo Pereira da Silva"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: 
+http://groupware.les.inf.puc-rio.br/har
+
+## Objective
+
+The goal of the project is to predict the manner in which they did the exercise. This is the **"classe"** variable in the training set.  
+
+## Analysis
+
+The first step of this exercise is to import the dataset and relevant packages.
+
+
+```{r, include=FALSE}
+library(caret)
+library(tidyverse)
+library(magrittr)
+```
+
+
+
+```{r}
+df <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+validation_set <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+```
+
+### EDA 
+Next, some EDA is performed. First, the number of NAs is analyzed:
+
+```{r}
+
+
+df %>% is.na() %>% 
+  colSums() %>% 
+  as.data.frame() %>% 
+  rename(missing_na = 1) %>% 
+  filter(missing_na > 0)
+
+
+```
+
+There are lots of variables in the dataset with a significant number of NAs. Thus, I delete the missing values from numeric variables. Specifically, I delete all variables with more than 25% of missing values.
+
+
+
+```{r}
+df %>% 
+  is.na() %>% 
+  {colSums(.)/NROW(.)} %>% 
+  Filter(function(x) x<0.25, .) %>% 
+  names() -> nonMissingVars
+
+df %<>% 
+  select(all_of(nonMissingVars))
+```
+
+After cleaning missing values pertaining to numeric covariates, I explore some additional descriptive statistics using the skim function from skimr:
+
+```{r}
+#DataExplorer::create_report(training_set)
+skimr::skim(df)
+
+
+```
+As can be seen, there is also a number of empty character variable. NZV may help to identify them, and exclude them.
+
+#### NZV
+
+Now, I eliminate near zero variance variables. 
+```{r}
+
+nsv_obj <- nearZeroVar(df, saveMetrics = TRUE)
+nsv_obj
+
+df <- df[, !nsv_obj$nzv]
+
+
+
+
+```
+The target variable is defined as character. It will be re-classified as factor.
+The user name is classified as character. Next, one hot encoding is applied to this variable.
+Finally, cvtd_timestamp is coded as character, but it is actually a date variable.
+
+
+```{r}
+
+sapply(df, class) |> 
+  as.data.frame() |> 
+  rename(type = 1 ) |>
+  arrange(type)
+
+
+df %<>% 
+  mutate(classe = factor(classe),
+         cvtd_timestamp = lubridate::parse_date_time(cvtd_timestamp, "%d/%m/%Y %H:%M")) %>% 
+  select(-X) #, raw_timestamp_part_1, raw_timestamp_part_2
+```
+
+
+```{r}
+
+classe <- df$classe
+df <- dummyVars(classe ~ ., df) %>% 
+  predict(df) %>% 
+  as.data.frame() %>% 
+  add_column(classe = classe)
+
+df
+```
+
+After the application of on-hot-encoding, there are still no near zero variables.
+
+```{r}
+nearZeroVar(df)
+
+```
+
+Let's proceed with preliminary data pre-processing.
+
+
+#### Correlations and multicolinearity 
+Next, let's gauge whether predictors are highly correlated.
+
+```{r}
+correl <- findCorrelation(na.omit(df) %>% select(where(is.numeric)) %>%  cor(), cutoff = .75)
+correl
+
+
+```
+Almost one third of the dataset is redundant. These columns will be dropped from the dataset. We are left with 35 predictors.
+
+```{r}
+correl_cols<-df %>% 
+  select(where(is.numeric)) %>% 
+  select(all_of(correl)) %>% 
+  colnames()
+
+df %<>% 
+  select(-all_of(correl_cols))
+```
+
+
+
+Apparently, there are no linear combinations in the dataset. So, let's continue.
+
+```{r}
+linear_comb <- findLinearCombos(df %>% select_if(is.numeric))
+linear_comb
+```
+#### Addtional plots
+
+All variables are numeric, and we have no missing values among the predictors. Nice!!!
+
+
+```{r}
+visdat::vis_dat(df)
+visdat::vis_guess(df)
+visdat::vis_miss(df)
+```
+
+
+
+```{r}
+featurePlot(x = df[, -which(names(df) == "classe")], y =df$classe, plot = 'pairs')
+#featurePlot(x = df[, setdiff(names(df), "classe")], y =df$classe, plot = 'box')
+
+```
+
+As there are no NAs in the dataset, there is no need for NA imputation.
+
+```{r}
+df |> is.na() |> colSums() |> as_tibble() %>% arrange(value, desc = TRUE)
+```
+
+
+The dependent variable is multinomial. There is some imbalance, but it is not strong.
+
+```{r}
+table(df$classe) |> prop.table() |> knitr::kable()
+```
+### Modelling
+
+
+Let's split the dataset into training set and test set. 
+
+
+```{r}
+set.seed(123)
+trainIndex <- createDataPartition(df$classe, p = 0.75, list = FALSE)
+trainingSet <- df[trainIndex,]
+testSet <- df[-trainIndex,]
+
+```
+
+The next step is to define a trainControl function. CV with 5 folds is defined, for the sake of time.
+I save predictions of each subfold and class probabilities.
+
+```{r}
+ctrl <- trainControl(
+  method = "cv",#repeatedcv
+  number = 5,
+  #repeats = 5,
+  savePredictions = "final",
+  #multiClassSummary = TRUE,
+  classProbs = TRUE, 
+  verboseIter = FALSE, 
+  allowParallel = TRUE
+)
+
+```
+
+Given the complexity of the models, the estimation is "parallelized".
+
+```{r}
+library(doParallel)
+        
+# Check how many cores you have to work with
+detectCores()
+
+# Set the number of clusters caret has to work with. Creates number of clusters = cores-1
+cl <- makePSOCKcluster(detectCores() - 2) 
+
+#cl <- makePSOCKcluster(8)  
+registerDoParallel(cl)
+getDoParWorkers()
+
+
+
+
+
+```
+Nine different models are tested. A wrapping function is used to pass all the models at once.
+
+```{r}
+# define models to try
+models <- c("multinom", "lda", "naive_bayes", "svmPoly", "knn", "rpart", "ranger", "glmnet", "nnet")
+
+# set CV control for knn, k-folds
+# control <- trainControl(method = "cv", number = 10, p = .9) # 10 fold, 10%
+
+# fit models
+
+train_models <- lapply(models, function(model){
+    print(model)
+    set.seed(123)
+    train(classe ~ ., 
+          method = model, 
+          data = trainingSet, 
+          trControl = ctrl, 
+          preProcess = c("center","scale"),
+          metric = "Kappa",
+          tuneLength = 10)
+})
+
+names(train_models) <- models
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+Now, let's see the summary results for each method:
+
+
+```{r}
+resamples(train_models) |> summary()
+```
+
+Nice, our best models are random forests (ranger), knn and neural nets. But, these results pertain to the training set.
+
+```{r}
+bwplot(resamples(train_models))
+```
+
+
+The random forest model has an outstanding performance. Let's see its behavior during the tunning process:
+
+```{r}
+plot(train_models$ranger, print.thres = 0.5, type="S")
+
+```
+
+Below, one may find the results of the tunning process of the ranger model:
+
+```{r}
+train_models$ranger$results
+
+```
+So, our best tunning parameters are as follows:
+
+```{r}
+train_models$ranger$bestTune
+```
+
+Also remarkable is that results are consistent across folds.
+```{r}
+train_models$ranger$resample
+```
+But, how does each model behave in the testing set?
+
+Now, let's see how the different models behaved:
+
+```{r}
+sapply(train_models, 
+       function(x){
+         pred <- predict(x, testSet)
+         MLmetrics::F1_Score(y_true = testSet$classe, y_pred = pred)
+         
+       }) |> reshape2::melt() %>% 
+#rowid_to_column() %>% 
+  rownames_to_column(var = "model")|>
+  ggplot(aes(x=reorder(model, value), y=value))+
+  geom_bar(stat="identity", fill = "blue")+
+  ggtitle("Model Comparison")+
+  labs(x="F1_Score", y="Model")+
+  coord_flip() +
+  theme_minimal()
+
+
+
+```
+Ok, these results also point to the prevalence of the random forest model as the one displaying larger out of sample accuracy. 
+
+
+
+
+
+What about variable importance? For that, one has to retrain our model and define "importance = impurity"
+
+```{r}
+
+train(classe ~ ., 
+          method = "ranger", 
+          data = trainingSet, 
+          trControl = ctrl, 
+          preProcess = c("center","scale"),
+#          metric = "Kappa",
+          importance='impurity',
+          tuneGrid = train_models$ranger$bestTune) %>% 
+          varImp(.) %>% 
+          ggplot() +
+          ggtitle("Variable Importances")  
+
+
+
+
+
+
+
+```
+
+Now, let's see some additional out of sample prediction stats:
+
+```{r}
+# Calculate performance on the Test. Pass two vector to calculate performance metrics
+
+pred <- predict(ranger_fit, testSet) |> as_data_frame()
+
+confusionMatrix(factor(testSet$classe), factor(pred$value)) 
+
+
+postResample(factor(testSet$classe), factor(pred$value))
+```
+
+
+```{r}
+## or predicting using the probabilities (nice because you can get ROC)
+probs <- extractProb(list(model=ranger_fit), testX = testSet, testY = testSet$classe)
+
+#predict(ranger_fit, testSet, type = "prob")
+```
+
+
+```{r}
+## Make sure the levels are appropriate for multiClassSummary(), ie case group is first level
+levs <- LETTERS[1:5]
+probs$obs <- factor(probs$obs, levels = levs)
+probs$pred <- factor(probs$pred, levels = levs)
+```
+
+
+```{r}
+## Calculating Accuracy
+mean(probs$obs==probs$pred)
+## pred column shows model predicted label if cutoff for calling label = 0.5
+table(probs$obs, probs$pred)
+multiClassSummary(probs, lev = levels(probs$obs))
+```
+
+
+
+
+
+```{r}
+library(pROC)
+rangerROC <- roc(testSet$classe |> factor(), probs$A[probs$dataType== "Test"])
+rangerROC
+
+plot(rangerROC, metric = "ROC")
+
+```
+
+
+
+Let's compare our two best models:
+
+
+```{r}
+train_models[c("ranger", "knn")] |> resamples() |>
+  xyplot(., what = "BlandAltman")
+
+
+
+train_models[c("ranger", "knn")] |> 
+  resamples() |>
+  diff() |> 
+  summary()
+
+```
+Random forest seems to clearly outperform KNN.
+
+### Final Predictions
+```{r}
+validation_set2 <- validation_set %>% 
+  select(any_of(nonMissingVars)) 
+
+validation_set2 <- validation_set2 %>% 
+  select(!names(validation_set2)[nsv_obj$nzv])
+
+
+validation_set2 <- dummyVars( ~ ., validation_set2) %>% 
+  predict(validation_set2) %>% 
+  as.data.frame()
+
+
+
+validation_set2 %<>% 
+  select(-any_of(correl_cols))
+
+predict(ranger_fit, validation_set2) |> as_data_frame()
+
+```
+
