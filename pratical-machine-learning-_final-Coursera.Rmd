@@ -118,7 +118,7 @@ df <- dummyVars(classe ~ ., df) %>%
   as.data.frame() %>% 
   add_column(classe = classe)
 
-df
+
 ```
 
 After the application of on-hot-encoding, there are still no near zero variables.
